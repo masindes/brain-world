@@ -1,7 +1,8 @@
 """
 WorldQuant BRAIN – Flask JSON API
 ===================================
-Serves the React frontend in production and exposes /api/* endpoints.
+Local auth gate:  watty.s@outlook.com / 1234
+WQ BRAIN creds:   stored in credentials.json (configure via /setup in the UI)
 
 Dev:
     pip install flask flask-cors requests
@@ -9,33 +10,42 @@ Dev:
     cd frontend && npm run dev   # React on :5173 (proxies /api → :5000)
 """
 
+import hashlib
+import json
+import time
+from pathlib import Path
+
 import requests as _requests
 from flask import Flask, jsonify, request, session
 from flask_cors import CORS
 from wq_client import WQClient, WQAuthError, WQSimulationError
 
 BASE_URL = "https://api.worldquantbrain.com"
+CREDENTIALS_FILE = Path(__file__).parent / "credentials.json"
 
 app = Flask(__name__, static_folder="frontend/dist", static_url_path="")
-app.secret_key = "wq-brain-local-dev-secret"
-CORS(app, supports_credentials=True)
+app.secret_key = "wq-brain-local-dev-secret-xK9mP2"
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SECURE"] = False
+CORS(app, supports_credentials=True, origins=["http://localhost:5173", "http://localhost:5000"])
+
+# In-memory simulation history (last 100 runs per server session)
+_simulation_history = []
+
+# ---------------------------------------------------------------------------
+# Local auth users  (email → sha256(password))
+# ---------------------------------------------------------------------------
+_LOCAL_USERS = {
+    "watty.s@outlook.com": hashlib.sha256(b"1234").hexdigest(),
+}
 
 
-# ------------------------------------------------------------------ #
+# ---------------------------------------------------------------------------
 # Helpers
-# ------------------------------------------------------------------ #
+# ---------------------------------------------------------------------------
 
-def _make_client():
-    email = session.get("email")
-    password = session.get("password")
-    if not email or not password:
-        return None
-    c = WQClient(email=email, password=password)
-    c._logged_in = True
-    return c
-
-
-def _err(msg, code=400):
+def _err(msg: str, code: int = 400):
     return jsonify({"error": msg}), code
 
 
@@ -45,80 +55,53 @@ def _require_auth():
     return None
 
 
-# ------------------------------------------------------------------ #
+def _get_wq_creds():
+    if CREDENTIALS_FILE.exists():
+        try:
+            d = json.loads(CREDENTIALS_FILE.read_text())
+            return d.get("email"), d.get("password")
+        except Exception:
+            pass
+    return None, None
+
+
+def _make_client():
+    email, pw = _get_wq_creds()
+    if not email or not pw:
+        return None
+    c = WQClient(email=email, password=pw)
+    c._logged_in = True
+    return c
+
+
+# ---------------------------------------------------------------------------
 # Auth endpoints
-# ------------------------------------------------------------------ #
+# ---------------------------------------------------------------------------
 
 @app.route("/api/me")
 def me():
     if "email" not in session:
         return _err("Not authenticated.", 401)
-    return jsonify({"email": session["email"]})
+    wq_email, _ = _get_wq_creds()
+    return jsonify({"email": session["email"], "wq_configured": wq_email is not None})
 
 
 @app.route("/api/login", methods=["POST"])
 def login():
     body = request.get_json(force=True) or {}
-    email = body.get("email", "").strip()
+    email = body.get("email", "").strip().lower()
     password = body.get("password", "").strip()
 
     if not email or not password:
         return _err("Email and password are required.")
 
-    s = _requests.Session()
-    s.auth = (email, password)
+    pw_hash = hashlib.sha256(password.encode()).hexdigest()
+    if _LOCAL_USERS.get(email) != pw_hash:
+        return _err("Invalid email or password.", 401)
 
-    try:
-        resp = s.post(f"{BASE_URL}/authentication", timeout=20)
-        data = resp.json()
-    except Exception as exc:
-        return _err(f"Request failed: {exc}")
-
-    if "user" in data:
-        session.clear()
-        session["email"] = email
-        session["password"] = password
-        return jsonify({"ok": True})
-
-    if "inquiry" in data:
-        persona_url = f"{resp.url}/persona?inquiry={data['inquiry']}"
-        # Stash pending credentials so /api/login/verify can retry
-        session["pending_email"] = email
-        session["pending_password"] = password
-        session["pending_inquiry"] = data["inquiry"]
-        session["pending_auth_url"] = resp.url
-        return jsonify({"biometric_required": True, "biometric_url": persona_url})
-
-    return _err(f"Login failed: {data}", 401)
-
-
-@app.route("/api/login/verify", methods=["POST"])
-def login_verify():
-    """Called after the user completes biometric verification in their browser."""
-    email = session.get("pending_email")
-    password = session.get("pending_password")
-    inquiry = session.get("pending_inquiry")
-    auth_url = session.get("pending_auth_url")
-
-    if not all([email, password, inquiry, auth_url]):
-        return _err("No pending verification. Start login again.", 400)
-
-    s = _requests.Session()
-    s.auth = (email, password)
-
-    try:
-        retry = s.post(f"{auth_url}/persona", json={"inquiry": inquiry}, timeout=20)
-        data = retry.json()
-    except Exception as exc:
-        return _err(f"Request failed: {exc}")
-
-    if "user" in data:
-        session.clear()
-        session["email"] = email
-        session["password"] = password
-        return jsonify({"ok": True})
-
-    return _err(f"Verification did not complete: {data}", 401)
+    session.clear()
+    session["email"] = email
+    return jsonify({"ok": True})
 
 
 @app.route("/api/logout", methods=["POST"])
@@ -127,9 +110,68 @@ def logout():
     return jsonify({"ok": True})
 
 
-# ------------------------------------------------------------------ #
+# ---------------------------------------------------------------------------
+# WQ BRAIN credentials management
+# ---------------------------------------------------------------------------
+
+@app.route("/api/wq-credentials")
+def wq_credentials_status():
+    guard = _require_auth()
+    if guard:
+        return guard
+    wq_email, _ = _get_wq_creds()
+    return jsonify({"configured": wq_email is not None, "email": wq_email or ""})
+
+
+@app.route("/api/wq-credentials", methods=["POST"])
+def save_wq_credentials():
+    guard = _require_auth()
+    if guard:
+        return guard
+    body = request.get_json(force=True) or {}
+    email = body.get("email", "").strip()
+    password = body.get("password", "").strip()
+    if not email or not password:
+        return _err("WQ email and password are required.")
+
+    CREDENTIALS_FILE.write_text(json.dumps({"email": email, "password": password}, indent=2))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/wq-credentials", methods=["DELETE"])
+def delete_wq_credentials():
+    guard = _require_auth()
+    if guard:
+        return guard
+    if CREDENTIALS_FILE.exists():
+        CREDENTIALS_FILE.unlink()
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Simulation history
+# ---------------------------------------------------------------------------
+
+@app.route("/api/history")
+def get_history():
+    guard = _require_auth()
+    if guard:
+        return guard
+    return jsonify(list(reversed(_simulation_history[-100:])))
+
+
+@app.route("/api/history", methods=["DELETE"])
+def clear_history():
+    guard = _require_auth()
+    if guard:
+        return guard
+    _simulation_history.clear()
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
 # Dataset & field discovery
-# ------------------------------------------------------------------ #
+# ---------------------------------------------------------------------------
 
 @app.route("/api/datasets")
 def datasets():
@@ -137,13 +179,17 @@ def datasets():
     if guard:
         return guard
 
-    region = request.args.get("region", "USA")
+    client = _make_client()
+    if not client:
+        return _err("WQ BRAIN credentials not configured. Visit /setup to add them.", 503)
+
+    region   = request.args.get("region", "USA")
     universe = request.args.get("universe", "TOP3000")
-    delay = int(request.args.get("delay", 1))
-    search = request.args.get("search", "").strip().lower()
+    delay    = int(request.args.get("delay", 1))
+    search   = request.args.get("search", "").strip().lower()
 
     try:
-        results = _make_client().get_datasets(region=region, universe=universe, delay=delay)
+        results = client.get_datasets(region=region, universe=universe, delay=delay)
     except Exception as exc:
         return _err(str(exc))
 
@@ -162,17 +208,21 @@ def fields():
     if guard:
         return guard
 
+    client = _make_client()
+    if not client:
+        return _err("WQ BRAIN credentials not configured. Visit /setup to add them.", 503)
+
     dataset_id = request.args.get("dataset_id", "").strip()
-    region = request.args.get("region", "USA")
-    universe = request.args.get("universe", "TOP3000")
-    delay = int(request.args.get("delay", 1))
-    search = request.args.get("search", "").strip().lower()
+    region     = request.args.get("region", "USA")
+    universe   = request.args.get("universe", "TOP3000")
+    delay      = int(request.args.get("delay", 1))
+    search     = request.args.get("search", "").strip().lower()
 
     if not dataset_id:
         return _err("dataset_id is required.")
 
     try:
-        results = _make_client().get_data_fields(
+        results = client.get_data_fields(
             dataset_id=dataset_id, region=region, universe=universe, delay=delay
         )
     except Exception as exc:
@@ -187,9 +237,9 @@ def fields():
     return jsonify(results)
 
 
-# ------------------------------------------------------------------ #
+# ---------------------------------------------------------------------------
 # Alpha simulation
-# ------------------------------------------------------------------ #
+# ---------------------------------------------------------------------------
 
 @app.route("/api/simulate", methods=["POST"])
 def simulate():
@@ -197,35 +247,68 @@ def simulate():
     if guard:
         return guard
 
-    body = request.get_json(force=True) or {}
+    client = _make_client()
+    if not client:
+        return _err("WQ BRAIN credentials not configured. Visit /setup to add them.", 503)
+
+    body       = request.get_json(force=True) or {}
     expression = body.get("expression", "").strip()
     if not expression:
         return _err("expression is required.")
 
+    region      = body.get("region", "USA")
+    universe    = body.get("universe", "TOP3000")
+    delay       = int(body.get("delay", 1))
+    decay       = int(body.get("decay", 6))
+    truncation  = float(body.get("truncation", 0.1))
+    neutralization = body.get("neutralization", "SUBINDUSTRY")
+    pasteurization = body.get("pasteurization", "ON")
+    nan_handling   = body.get("nan_handling", "OFF")
+    timeout        = int(body.get("timeout", 300))
+
     try:
-        result = _make_client().simulate_alpha(
+        result = client.simulate_alpha(
             expression,
-            region=body.get("region", "USA"),
-            universe=body.get("universe", "TOP3000"),
-            delay=int(body.get("delay", 1)),
-            decay=int(body.get("decay", 6)),
-            truncation=float(body.get("truncation", 0.1)),
-            neutralization=body.get("neutralization", "SUBINDUSTRY"),
-            pasteurization=body.get("pasteurization", "ON"),
-            nan_handling=body.get("nan_handling", "OFF"),
-            timeout=int(body.get("timeout", 300)),
+            region=region,
+            universe=universe,
+            delay=delay,
+            decay=decay,
+            truncation=truncation,
+            neutralization=neutralization,
+            pasteurization=pasteurization,
+            nan_handling=nan_handling,
+            timeout=timeout,
         )
     except (WQSimulationError, WQAuthError) as exc:
         return _err(str(exc))
     except Exception as exc:
         return _err(f"Unexpected error: {exc}")
 
+    # Store in history
+    _simulation_history.append({
+        "id": len(_simulation_history) + 1,
+        "timestamp": time.time(),
+        "expression": expression,
+        "region": region,
+        "universe": universe,
+        "delay": delay,
+        "sharpe": result.get("sharpe"),
+        "fitness": result.get("fitness"),
+        "turnover": result.get("turnover"),
+        "passed_checks": result.get("passed_checks"),
+        "total_checks": result.get("total_checks"),
+        "alpha_id": result.get("alpha_id"),
+        "link": result.get("link"),
+    })
+    if len(_simulation_history) > 100:
+        _simulation_history.pop(0)
+
     return jsonify(result)
 
 
-# ------------------------------------------------------------------ #
+# ---------------------------------------------------------------------------
 # Serve React SPA in production
-# ------------------------------------------------------------------ #
+# ---------------------------------------------------------------------------
 
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
@@ -240,6 +323,8 @@ def spa(path):
 
 
 if __name__ == "__main__":
-    print("API server running at http://localhost:5000")
-    print("For React dev UI: cd frontend && npm run dev")
+    print("=" * 55)
+    print("  WQ BRAIN UI  →  http://localhost:5000")
+    print("  Local login  :  watty.s@outlook.com / 1234")
+    print("=" * 55)
     app.run(debug=True, port=5000, threaded=True)

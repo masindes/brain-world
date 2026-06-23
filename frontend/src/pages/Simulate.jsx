@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams, Link } from 'react-router-dom'
 
 const REGIONS        = ['USA', 'EUR', 'ASI', 'AUS', 'JPN']
 const UNIVERSES      = ['TOP3000', 'TOP2000', 'TOP1000', 'TOP500', 'TOP200']
@@ -38,6 +38,14 @@ export default function Simulate() {
   const [result, setResult] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError]   = useState(null)
+  const [wqOk, setWqOk]    = useState(null)
+
+  useEffect(() => {
+    fetch('/api/wq-credentials', { credentials: 'include' })
+      .then(r => r.json())
+      .then(d => setWqOk(d.configured))
+      .catch(() => setWqOk(false))
+  }, [])
 
   function set(key, val) { setForm(f => ({ ...f, [key]: val })) }
 
@@ -65,6 +73,16 @@ export default function Simulate() {
   return (
     <div className="max-w-2xl space-y-6">
       <h1 className="text-lg font-semibold text-fg">▶ Simulate Alpha</h1>
+
+      {wqOk === false && (
+        <div className="flex items-center justify-between p-4 rounded-lg border border-warning/40 bg-yellow-900/10">
+          <div className="flex items-center gap-3">
+            <span>⚠</span>
+            <p className="text-sm text-warning">WQ BRAIN credentials not configured — simulations will fail.</p>
+          </div>
+          <Link to="/setup" className="btn-primary text-xs whitespace-nowrap">Configure →</Link>
+        </div>
+      )}
 
       <form onSubmit={handleSubmit} className="card p-5 space-y-4">
         {/* Expression */}
