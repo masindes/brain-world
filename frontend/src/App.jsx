@@ -5,8 +5,9 @@ import Dashboard from './pages/Dashboard'
 import Datasets  from './pages/Datasets'
 import Fields    from './pages/Fields'
 import Simulate  from './pages/Simulate'
-import Setup     from './pages/Setup'
-import Layout    from './pages/Layout'
+import Setup      from './pages/Setup'
+import MarketData from './pages/MarketData'
+import Layout     from './pages/Layout'
 
 export const AuthCtx = createContext(null)
 
@@ -44,6 +45,7 @@ export default function App() {
             <Route path="fields"     element={<Fields />} />
             <Route path="simulate"   element={<Simulate />} />
             <Route path="setup"      element={<Setup />} />
+            <Route path="market"     element={<MarketData />} />
           </Route>
         </Routes>
       </BrowserRouter>

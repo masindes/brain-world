@@ -3,10 +3,11 @@ import { useState, useEffect } from 'react'
 import { useAuth } from '../App'
 
 const navItems = [
-  { to: '/',         label: 'Dashboard', icon: '⊞', exact: true },
-  { to: '/datasets', label: 'Datasets',  icon: '🗂' },
-  { to: '/fields',   label: 'Fields',    icon: '🔍' },
-  { to: '/simulate', label: 'Simulate',  icon: '▶'  },
+  { to: '/',        label: 'Dashboard',   icon: '⊞', exact: true },
+  { to: '/market',  label: 'Market Data', icon: '📈' },
+  { to: '/datasets',label: 'Datasets',    icon: '🗂' },
+  { to: '/fields',  label: 'Fields',      icon: '🔍' },
+  { to: '/simulate',label: 'Simulate',    icon: '▶'  },
 ]
 
 export default function Layout() {

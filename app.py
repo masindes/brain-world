@@ -307,6 +307,212 @@ def simulate():
 
 
 # ---------------------------------------------------------------------------
+# Market data  (Alpha Vantage — free API key, 25 req/day, no credit card)
+# Get a free key at: https://www.alphavantage.co/support/#api-key
+# ---------------------------------------------------------------------------
+
+AV_KEY_FILE = Path(__file__).parent / "av_key.txt"
+AV_BASE     = "https://www.alphavantage.co/query"
+
+_PERIOD_TO_OUTPUT = {
+    "1mo": "compact",  "3mo": "compact",
+    "6mo": "compact",  "1y":  "full",
+    "2y":  "full",     "5y":  "full",
+}
+_PERIOD_DAYS = {"1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730, "5y": 1825}
+
+
+def _av_key():
+    if AV_KEY_FILE.exists():
+        k = AV_KEY_FILE.read_text().strip()
+        if k:
+            return k
+    return None
+
+
+def _av_get(params):
+    key = _av_key()
+    if not key:
+        raise ValueError("Alpha Vantage API key not configured. Visit /setup to add it.")
+    params["apikey"] = key
+    r = _requests.get(AV_BASE, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if "Information" in data:
+        raise ValueError(data["Information"])
+    if "Note" in data:
+        raise ValueError("Rate limit reached. Alpha Vantage free tier: 25 requests/day.")
+    return data
+
+
+@app.route("/api/market/av-key")
+def get_av_key_status():
+    guard = _require_auth()
+    if guard:
+        return guard
+    return jsonify({"configured": _av_key() is not None})
+
+
+@app.route("/api/market/av-key", methods=["POST"])
+def save_av_key():
+    guard = _require_auth()
+    if guard:
+        return guard
+    body = request.get_json(force=True) or {}
+    key  = body.get("key", "").strip()
+    if not key:
+        return _err("API key is required.")
+    # Quick validation
+    try:
+        r = _requests.get(AV_BASE, params={"function": "GLOBAL_QUOTE", "symbol": "IBM", "apikey": key}, timeout=15)
+        d = r.json()
+        if "Global Quote" not in d:
+            return _err(d.get("Information") or d.get("Note") or "Invalid key.")
+    except Exception as exc:
+        return _err(f"Could not verify key: {exc}")
+    AV_KEY_FILE.write_text(key)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/market/av-key", methods=["DELETE"])
+def delete_av_key():
+    guard = _require_auth()
+    if guard:
+        return guard
+    if AV_KEY_FILE.exists():
+        AV_KEY_FILE.unlink()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/market/search")
+def market_search():
+    guard = _require_auth()
+    if guard:
+        return guard
+    query = request.args.get("q", "").strip()
+    if not query:
+        return _err("q is required.")
+    try:
+        data = _av_get({"function": "SYMBOL_SEARCH", "keywords": query})
+        out = [
+            {
+                "symbol":   m.get("1. symbol", ""),
+                "name":     m.get("2. name", ""),
+                "type":     m.get("3. type", ""),
+                "exchange": m.get("4. region", ""),
+            }
+            for m in data.get("bestMatches", [])
+            if m.get("1. symbol")
+        ]
+        return jsonify(out)
+    except Exception as exc:
+        return _err(str(exc))
+
+
+@app.route("/api/market/quote")
+def market_quote():
+    guard = _require_auth()
+    if guard:
+        return guard
+    symbol = request.args.get("symbol", "").strip().upper()
+    if not symbol:
+        return _err("symbol is required.")
+    try:
+        data  = _av_get({"function": "GLOBAL_QUOTE", "symbol": symbol})
+        q     = data.get("Global Quote", {})
+        if not q:
+            return _err(f"No data found for '{symbol}'.", 404)
+
+        price = float(q.get("05. price", 0) or 0)
+        prev  = float(q.get("08. previous close", 0) or 0)
+        chg   = float(q.get("09. change", 0) or 0)
+        chg_p_raw = q.get("10. change percent", "0%").replace("%", "")
+        chg_p = float(chg_p_raw or 0)
+
+        # Fetch overview for fundamentals (best-effort)
+        name = symbol
+        sector = industry = summary = None
+        market_cap = pe = eps = week52h = week52l = beta = div_yield = None
+        try:
+            ov = _av_get({"function": "OVERVIEW", "symbol": symbol})
+            name       = ov.get("Name", symbol)
+            sector     = ov.get("Sector") or None
+            industry   = ov.get("Industry") or None
+            summary    = ov.get("Description") or None
+            market_cap = int(ov["MarketCapitalization"]) if ov.get("MarketCapitalization", "None") not in ("None", "", None) else None
+            pe         = float(ov["TrailingPE"]) if ov.get("TrailingPE", "None") not in ("None", "", "-") else None
+            eps        = float(ov["EPS"]) if ov.get("EPS", "None") not in ("None", "", "-") else None
+            week52h    = float(ov["52WeekHigh"]) if ov.get("52WeekHigh", "None") not in ("None", "", "-") else None
+            week52l    = float(ov["52WeekLow"]) if ov.get("52WeekLow", "None") not in ("None", "", "-") else None
+            beta       = float(ov["Beta"]) if ov.get("Beta", "None") not in ("None", "", "-") else None
+            div_yield  = float(ov["DividendYield"]) if ov.get("DividendYield", "None") not in ("None", "", "-", "0") else None
+        except Exception:
+            pass
+
+        return jsonify({
+            "symbol":              symbol,
+            "name":                name,
+            "price":               price,
+            "previous_close":      prev,
+            "change":              chg,
+            "change_pct":          chg_p,
+            "currency":            "USD",
+            "exchange":            q.get("Exchange", ""),
+            "market_cap":          market_cap,
+            "volume":              int(q.get("06. volume", 0) or 0),
+            "avg_volume":          None,
+            "fifty_two_week_high": week52h,
+            "fifty_two_week_low":  week52l,
+            "pe_ratio":            pe,
+            "forward_pe":          None,
+            "eps":                 eps,
+            "dividend_yield":      div_yield,
+            "beta":                beta,
+            "sector":              sector,
+            "industry":            industry,
+            "summary":             summary,
+        })
+    except Exception as exc:
+        return _err(str(exc))
+
+
+@app.route("/api/market/history")
+def market_history():
+    guard = _require_auth()
+    if guard:
+        return guard
+    symbol = request.args.get("symbol", "").strip().upper()
+    period = request.args.get("period", "6mo")
+    if not symbol:
+        return _err("symbol is required.")
+
+    outputsize = _PERIOD_TO_OUTPUT.get(period, "compact")
+    days_limit = _PERIOD_DAYS.get(period, 180)
+
+    try:
+        import datetime
+        cutoff = datetime.date.today() - datetime.timedelta(days=days_limit)
+        data   = _av_get({"function": "TIME_SERIES_DAILY", "symbol": symbol, "outputsize": outputsize})
+        ts     = data.get("Time Series (Daily)", {})
+        rows   = []
+        for date_str in sorted(ts):
+            if datetime.date.fromisoformat(date_str) < cutoff:
+                continue
+            d = ts[date_str]
+            rows.append({
+                "date":   date_str,
+                "open":   float(d.get("1. open", 0)),
+                "high":   float(d.get("2. high", 0)),
+                "low":    float(d.get("3. low", 0)),
+                "close":  float(d.get("4. close", 0)),
+                "volume": int(d.get("5. volume", 0)),
+            })
+        return jsonify(rows)
+    except Exception as exc:
+        return _err(str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Serve React SPA in production
 # ---------------------------------------------------------------------------
 
